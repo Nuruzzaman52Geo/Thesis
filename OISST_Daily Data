@@ -1,0 +1,230 @@
+# =========================
+# FULL COLAB CODE (RESUME MODE + RETRY DOWNLOAD)
+# - Upload shapefile ZIP + reference GeoTIFF
+# - ERDDAP yearly NetCDF download (subset by bbox)
+# - Daily GeoTIFF export: /content/output/YYYY/MM/DD/YYYYMMDD.tif
+# - Resume mode: skips if output file already exists
+# - Robust download: retries on 503/429/502/504 + timeouts
+# =========================
+
+!pip -q install xarray netcdf4 rioxarray rasterio geopandas shapely fiona pyproj tqdm requests
+
+import os, glob, zipfile, shutil, math, time, random
+from datetime import datetime
+from tqdm import tqdm
+
+import requests
+import xarray as xr
+import rioxarray as rxr
+import geopandas as gpd
+from google.colab import files
+
+# -------------------------
+# SETTINGS (edit these)
+# -------------------------
+OUT_ROOT = "/content/output"
+NODATA = -9999.0
+
+START_YEAR = 1982
+END_YEAR   = 1985   # inclusive
+
+# if True: skip days that already have a tif written
+RESUME_MODE = True
+
+# if True: delete yearly tmp nc after processing (recommended)
+DELETE_TMP_NC = True
+
+# wait between years to reduce 503 likelihood
+SLEEP_BETWEEN_YEARS_SEC = 8
+
+# -------------------------
+# Robust downloader with retries
+# -------------------------
+def download(url, out_path, max_retries=8, base_wait=8):
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, stream=True, timeout=180)
+            if r.status_code in (503, 429, 502, 504):
+                wait = base_wait * (2 ** (attempt - 1)) + random.uniform(0, 3)
+                msg = r.text[:250].replace("\n", " ")
+                print(f"HTTP {r.status_code} (attempt {attempt}/{max_retries}). Wait {wait:.1f}s then retry...")
+                print("Server:", msg)
+                time.sleep(wait)
+                continue
+
+            if r.status_code != 200:
+                print("HTTP:", r.status_code)
+                print("Server message (first 1200 chars):\n", r.text[:1200])
+            r.raise_for_status()
+
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return  # success
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            wait = base_wait * (2 ** (attempt - 1)) + random.uniform(0, 3)
+            print(f"Network error (attempt {attempt}/{max_retries}): {e}. Wait {wait:.1f}s then retry...")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Failed after {max_retries} retries: {url}")
+
+# -------------------------
+# Upload shapefile ZIP
+# -------------------------
+print("UPLOAD 1/2: Upload shapefile ZIP")
+up1 = files.upload()
+zip_files = [f for f in up1 if f.lower().endswith(".zip")]
+if not zip_files:
+    raise ValueError("No ZIP uploaded.")
+shp_zip = zip_files[0]
+
+SHAPE_DIR = "/content/shapefile"
+os.makedirs(SHAPE_DIR, exist_ok=True)
+with zipfile.ZipFile(shp_zip, "r") as z:
+    z.extractall(SHAPE_DIR)
+
+shp_path = glob.glob(SHAPE_DIR + "/**/*.shp", recursive=True)[0]
+print("Shapefile:", shp_path)
+
+# -------------------------
+# Upload reference GeoTIFF
+# -------------------------
+print("\nUPLOAD 2/2: Upload reference GeoTIFF (.tif)")
+up2 = files.upload()
+tif_files = [f for f in up2 if f.lower().endswith((".tif", ".tiff"))]
+if not tif_files:
+    raise ValueError("No reference tif uploaded.")
+ref_tif = tif_files[0]
+
+ref = rxr.open_rasterio(ref_tif).squeeze()
+print("Reference CRS:", ref.rio.crs)
+print("Reference shape:", ref.shape)
+
+# -------------------------
+# Read shapefile in EPSG:4326
+# -------------------------
+gdf = gpd.read_file(shp_path)
+if gdf.crs is None:
+    gdf = gdf.set_crs("EPSG:4326")
+else:
+    gdf = gdf.to_crs("EPSG:4326")
+
+lon_min, lat_min, lon_max, lat_max = gdf.total_bounds
+
+def snap_floor(x, step=0.25): return math.floor(x/step)*step
+def snap_ceil(x, step=0.25):  return math.ceil(x/step)*step
+
+lon_min_s = snap_floor(lon_min); lat_min_s = snap_floor(lat_min)
+lon_max_s = snap_ceil(lon_max);  lat_max_s = snap_ceil(lat_max)
+
+print("Snapped bbox:", lon_min_s, lat_min_s, lon_max_s, lat_max_s)
+
+# -------------------------
+# ERDDAP URL builder
+# dims: sst[time][zlev][latitude][longitude]
+# -------------------------
+BASE = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncdcOisst21Agg_LonPM180.nc"
+
+def erddap_url_year(year, latmin, latmax, lonmin, lonmax):
+    lo = min(latmin, latmax); hi = max(latmin, latmax)
+    return (f"{BASE}?sst[({year}-01-01):1:({year}-12-31)]"
+            f"[(0):1:(0)]"
+            f"[({lo}):1:({hi})]"
+            f"[({lonmin}):1:({lonmax})]")
+
+# -------------------------
+# Helpers
+# -------------------------
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def clear_fillvalue_conflicts(da):
+    # prevents: ValueError overwriting existing _FillValue in attrs
+    da.attrs.pop("_FillValue", None)
+    da.attrs.pop("missing_value", None)
+    if hasattr(da, "encoding") and isinstance(da.encoding, dict):
+        da.encoding.pop("_FillValue", None)
+        da.encoding.pop("missing_value", None)
+    return da
+
+# -------------------------
+# Main yearly processor (RESUME MODE)
+# -------------------------
+ensure_dir(OUT_ROOT)
+
+def process_year(year):
+    url = erddap_url_year(year, lat_min_s, lat_max_s, lon_min_s, lon_max_s)
+    tmp_nc = f"/content/tmp_{year}.nc"
+
+    # Download year nc (skip download if already present)
+    if not os.path.exists(tmp_nc):
+        print("\nDownloading year:", url)
+        download(url, tmp_nc)
+    else:
+        print(f"\nUsing existing tmp file: {tmp_nc}")
+
+    ds = xr.open_dataset(tmp_nc, decode_times=True)
+    da = ds["sst"]
+
+    # drop zlev
+    if "zlev" in da.dims:
+        da = da.isel(zlev=0, drop=True)
+
+    # set spatial dims (ERDDAP uses latitude/longitude)
+    da = da.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
+    da = da.rio.write_crs("EPSG:4326")
+
+    # Iterate days
+    times = da.time.values
+    pbar = tqdm(times, desc=f"Processing {year}")
+
+    for t in pbar:
+        d = datetime.strptime(str(t)[:10], "%Y-%m-%d")
+        yyyy, mm, dd = f"{d.year:04d}", f"{d.month:02d}", f"{d.day:02d}"
+
+        outdir = os.path.join(OUT_ROOT, yyyy, mm, dd)
+        ensure_dir(outdir)
+        out_tif = os.path.join(outdir, f"{yyyy}{mm}{dd}.tif")
+
+        # RESUME: skip if already exists
+        if RESUME_MODE and os.path.exists(out_tif):
+            continue
+
+        day = da.sel(time=t).squeeze()
+
+        # clip -> match reference
+        day = day.rio.clip(gdf.geometry, gdf.crs, drop=True)
+        day = day.rio.reproject_match(ref)
+
+        # fix fillvalue conflicts then write nodata
+        day = clear_fillvalue_conflicts(day)
+        day = day.rio.write_nodata(NODATA)
+
+        # write
+        day.rio.to_raster(out_tif, compress="LZW")
+
+    ds.close()
+
+    if DELETE_TMP_NC:
+        os.remove(tmp_nc)
+
+    print(f"✅ Finished year {year}")
+
+    if SLEEP_BETWEEN_YEARS_SEC > 0:
+        time.sleep(SLEEP_BETWEEN_YEARS_SEC)
+
+# -------------------------
+# RUN YEARS
+# -------------------------
+for y in range(START_YEAR, END_YEAR + 1):
+    process_year(y)
+
+# -------------------------
+# ZIP + DOWNLOAD
+# -------------------------
+def zip_and_download_output(zip_name="output.zip"):
+    shutil.make_archive("/content/output", "zip", OUT_ROOT)
+    files.download("/content/output.zip")
+
+zip_and_download_output()
