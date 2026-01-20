@@ -1,0 +1,923 @@
+!pip -q install rasterio geopandas shapely fiona pyproj rtree ipywidgets
+
+import os, glob, zipfile, re
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.windows import from_bounds
+from rasterio.mask import mask
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from google.colab import files
+
+uploaded = files.upload()  # upload your shapefile.zip
+zip_name = next(iter(uploaded.keys()))
+
+SHAPE_DIR = "/content/aoi_shape"
+os.makedirs(SHAPE_DIR, exist_ok=True)
+
+with zipfile.ZipFile(zip_name, "r") as z:
+    z.extractall(SHAPE_DIR)
+
+# load shapefile (find .shp)
+shps = glob.glob(os.path.join(SHAPE_DIR, "**", "*.shp"), recursive=True)
+print("Found shp:", shps)
+
+aoi = gpd.read_file(shps[0])
+aoi = aoi.to_crs("EPSG:4326")  # OISST যদি lon/lat হয়
+aoi_union = aoi.unary_union    # single geometry
+print(aoi.head())
+
+import os, zipfile, glob
+from google.colab import files
+
+# 1) Upload OISST zip from your computer
+uploaded = files.upload()   # select your OISST.zip
+zip_name = next(iter(uploaded.keys()))
+print("Uploaded:", zip_name)
+
+# 2) Unzip location
+BASE_DIR = "/content/OISST_TIF"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# 3) Unzip
+with zipfile.ZipFile(zip_name, "r") as z:
+    z.extractall(BASE_DIR)
+
+print("Unzipped to:", BASE_DIR)
+
+# 4) Find tif files anywhere inside
+tifs = glob.glob(os.path.join(BASE_DIR, "**", "*.tif"), recursive=True)
+print("Total tif found:", len(tifs))
+print("Example:", tifs[:5])
+
+def aoi_area_weighted_mean(tif_path, aoi_geom, is_kelvin=False):
+    with rasterio.open(tif_path) as src:
+        # mask to AOI (crop True)
+        out_img, out_transform = mask(src, [aoi_geom], crop=True, filled=True, nodata=np.nan)
+        arr = out_img[0].astype("float64")
+
+        if src.nodata is not None:
+            arr[arr == src.nodata] = np.nan
+
+        if is_kelvin:
+            arr = arr - 273.15
+
+        if np.all(~np.isfinite(arr)):
+            return np.nan
+
+        # lat of pixel centers from transform
+        nrows, ncols = arr.shape
+        rows = np.arange(nrows)
+        # y = f + (row+0.5)*e
+        ys = out_transform.f + (rows + 0.5) * out_transform.e
+        w = np.cos(np.deg2rad(ys))[:, None]
+
+        num = np.nansum(arr * w)
+        den = np.nansum(w * np.isfinite(arr))
+        return num / den if den != 0 else np.nan
+
+from rasterio.mask import mask
+
+def trend_map_for_month(selected_month_num, pairs, aoi_geom, is_kelvin=False, min_count=24):
+    # collect files for that month
+    month_files = [(y,m,fp) for (y,m,fp) in pairs if m == selected_month_num]
+    month_files.sort()
+
+    dates = pd.to_datetime([f"{y}-{m:02d}-01" for (y,m,fp) in month_files])
+    x = (dates - dates.min()).days.values / 365.25
+    x = x.astype("float64")
+
+    stack = []
+    ref_transform = None
+
+    for (y,m,fp) in month_files:
+        with rasterio.open(fp) as src:
+            # ✅ filled=False (masked array) → then convert masked to NaN
+            out_img, out_transform = mask(src, [aoi_geom], crop=True, filled=False)
+
+            arr = out_img[0].astype("float64")
+            arr[out_img[0].mask] = np.nan   # mask অংশ NaN
+
+            if src.nodata is not None:
+                arr[arr == src.nodata] = np.nan
+
+            if is_kelvin:
+                arr = arr - 273.15
+
+            if ref_transform is None:
+                ref_transform = out_transform
+
+        stack.append(arr)
+
+    stack = np.stack(stack, axis=0)  # (T,H,W)
+    T,H,W = stack.shape
+
+    valid = np.isfinite(stack)
+    count = valid.sum(axis=0)
+    enough = count >= min_count
+
+    x3 = x[:,None,None]
+
+    # safe mean via sum/count (warning-free)
+    x_sum = np.sum(np.where(valid, x3, 0.0), axis=0)
+    y_sum = np.sum(np.where(valid, stack, 0.0), axis=0)
+
+    x_mean = np.full((H,W), np.nan)
+    y_mean = np.full((H,W), np.nan)
+    anym = count > 0
+    x_mean[anym] = x_sum[anym] / count[anym]
+    y_mean[anym] = y_sum[anym] / count[anym]
+
+    dx = x3 - x_mean
+    dy = stack - y_mean
+    cov = np.sum(np.where(valid, dx*dy, 0.0), axis=0)
+    var = np.sum(np.where(valid, dx*dx, 0.0), axis=0)
+
+    slope_per_year = np.full((H,W), np.nan)
+    ok = enough & (var > 0)
+    slope_per_year[ok] = cov[ok] / var[ok]
+
+    trend_map = (slope_per_year * 10.0).astype("float32")  # °C/decade
+    return trend_map, ref_transform
+
+# ----- Install (run once) -----
+!pip -q install rasterio geopandas shapely fiona pyproj rtree ipywidgets
+
+import os, glob, zipfile, re
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.windows import from_bounds
+from rasterio.mask import mask
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from google.colab import files
+
+# -----------------------------
+# 1) Upload + unzip shapefile zip (AOI)
+# -----------------------------
+uploaded = files.upload()  # upload your shapefile.zip
+zip_name = next(iter(uploaded.keys()))
+
+SHAPE_DIR = "/content/aoi_shape"
+os.makedirs(SHAPE_DIR, exist_ok=True)
+
+with zipfile.ZipFile(zip_name, "r") as z:
+    z.extractall(SHAPE_DIR)
+
+shps = glob.glob(os.path.join(SHAPE_DIR, "**", "*.shp"), recursive=True)
+if len(shps) == 0:
+    raise ValueError("No .shp found inside the uploaded zip.")
+
+aoi = gpd.read_file(shps[0])
+
+# IMPORTANT: OISST GeoTIFF সাধারণত lon/lat হয়
+aoi = aoi.to_crs("EPSG:4326")
+aoi_union = aoi.unary_union
+
+print("Loaded AOI shp:", shps[0])
+print(aoi.head())
+
+# -----------------------------
+# 2) CONFIG
+# -----------------------------
+OISST_DIR = "/content/OISST_TIF/OISST"   # <-- আপনার actual folder
+OISST_IS_KELVIN = False
+
+# -----------------------------
+# 3) Index OISST tifs -> (year,month,fp)
+# filenames like: 1982_Jan.tif
+# -----------------------------
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTH_NUM = {m:i+1 for i,m in enumerate(MONTHS)}
+
+def parse_year_month(fp):
+    name = os.path.basename(fp)
+    y = re.search(r"(19|20)\d{2}", name)
+    if not y:
+        return None
+    year = int(y.group(0))
+
+    mon = None
+    for mm in MONTHS:
+        if mm.lower() in name.lower():
+            mon = MONTH_NUM[mm]
+            break
+    if mon is None:
+        return None
+    return year, mon
+
+tifs = glob.glob(os.path.join(OISST_DIR, "**", "*.tif"), recursive=True)
+pairs = []
+for fp in tifs:
+    ym = parse_year_month(fp)
+    if ym:
+        pairs.append((ym[0], ym[1], fp))
+
+pairs.sort()
+print("Total tif found:", len(tifs))
+print("Indexed (year,month,tif):", len(pairs))
+print("First 3:", pairs[:3])
+print("Last 3:", pairs[-3:])
+
+if len(pairs) == 0:
+    raise ValueError("No monthly tifs indexed. Check OISST_DIR or filenames.")
+
+# -----------------------------
+# 4) AOI area-weighted mean function (FIXED: filled=False)
+# -----------------------------
+def aoi_area_weighted_mean(tif_path, aoi_geom, is_kelvin=False):
+    with rasterio.open(tif_path) as src:
+        # filled=False → masked array (safe for integer rasters)
+        out_img, out_transform = mask(src, [aoi_geom], crop=True, filled=False)
+
+        arr = out_img[0].astype("float64")
+        arr[out_img[0].mask] = np.nan
+
+        # nodata -> NaN
+        if src.nodata is not None:
+            arr[arr == src.nodata] = np.nan
+
+        if is_kelvin:
+            arr = arr - 273.15
+
+        if np.all(~np.isfinite(arr)):
+            return np.nan
+
+        nrows, ncols = arr.shape
+        rows = np.arange(nrows)
+        ys = out_transform.f + (rows + 0.5) * out_transform.e
+        w = np.cos(np.deg2rad(ys))[:, None]
+
+        num = np.nansum(arr * w)
+        den = np.nansum(w * np.isfinite(arr))
+        return num / den if den != 0 else np.nan
+
+# -----------------------------
+# 5) Build monthly time series table (all months)
+# -----------------------------
+rows = []
+for year, mon, fp in pairs:
+    mean_val = aoi_area_weighted_mean(fp, aoi_union, is_kelvin=OISST_IS_KELVIN)
+    rows.append((year, mon, pd.Timestamp(year=year, month=mon, day=1), mean_val))
+
+df = pd.DataFrame(rows, columns=["year","month","date","sst"])
+print(df.head(), "\nRows:", len(df))
+
+# -----------------------------
+# 6) Month-specific pixel-wise trend map (FIXED: filled=False + shape guard)
+# -----------------------------
+def trend_map_for_month(selected_month_num, pairs, aoi_geom, is_kelvin=False, min_count=24):
+    month_files = [(y,m,fp) for (y,m,fp) in pairs if m == selected_month_num]
+    month_files.sort()
+
+    dates = pd.to_datetime([f"{y}-{m:02d}-01" for (y,m,fp) in month_files])
+    x = (dates - dates.min()).days.values / 365.25
+    x = x.astype("float64")
+
+    stack = []
+    x_keep = []
+    ref_transform = None
+    ref_shape = None
+    ref_profile = None
+
+    for (y,m,fp), xval in zip(month_files, x):
+        with rasterio.open(fp) as src:
+            out_img, out_transform = mask(src, [aoi_geom], crop=True, filled=False)
+            band = out_img[0]
+
+            arr = band.astype("float64")
+            arr[band.mask] = np.nan
+
+            if src.nodata is not None:
+                arr[arr == src.nodata] = np.nan
+            if is_kelvin:
+                arr = arr - 273.15
+
+            # reference shape/transform (first valid)
+            if ref_shape is None:
+                ref_shape = arr.shape
+                ref_transform = out_transform
+                ref_profile = src.profile.copy()
+
+        # skip if shape mismatch (rare but can happen)
+        if arr.shape != ref_shape:
+            continue
+
+        stack.append(arr)
+        x_keep.append(xval)
+
+    if len(stack) < min_count:
+        raise ValueError(f"Too few valid rasters for this month: {len(stack)} (<{min_count}).")
+
+    stack = np.stack(stack, axis=0)  # (T,H,W)
+    x_keep = np.array(x_keep, dtype="float64")
+
+    T, H, W = stack.shape
+
+    valid = np.isfinite(stack)
+    count = valid.sum(axis=0)
+    enough = count >= min_count
+
+    x3 = x_keep[:, None, None]
+
+    # safe mean via sum/count (no warnings)
+    x_sum = np.sum(np.where(valid, x3, 0.0), axis=0)
+    y_sum = np.sum(np.where(valid, stack, 0.0), axis=0)
+
+    x_mean = np.full((H,W), np.nan, dtype="float64")
+    y_mean = np.full((H,W), np.nan, dtype="float64")
+    anym = count > 0
+    x_mean[anym] = x_sum[anym] / count[anym]
+    y_mean[anym] = y_sum[anym] / count[anym]
+
+    dx = x3 - x_mean
+    dy = stack - y_mean
+
+    cov = np.sum(np.where(valid, dx * dy, 0.0), axis=0)
+    var = np.sum(np.where(valid, dx * dx, 0.0), axis=0)
+
+    slope_per_year = np.full((H,W), np.nan, dtype="float64")
+    ok = enough & (var > 0)
+    slope_per_year[ok] = cov[ok] / var[ok]
+
+    trend_map = (slope_per_year * 10.0).astype("float32")  # °C/decade
+
+    return trend_map, ref_transform
+
+# -----------------------------
+# 7) Interactive dropdown plot (line + map)
+# -----------------------------
+month_names = {
+    1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
+    7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"
+}
+
+dropdown = widgets.Dropdown(
+    options=[(month_names[i], i) for i in range(1,13)],
+    value=1,
+    description="Month:"
+)
+
+def plot_month_view(mnum):
+    dmon = df[df["month"] == mnum].sort_values("date")
+
+    # trend map
+    tmap, t_transform = trend_map_for_month(mnum, pairs, aoi_union, is_kelvin=OISST_IS_KELVIN)
+
+    # extent from transform
+    H, W = tmap.shape
+    left = t_transform.c
+    top  = t_transform.f
+    right = left + W * t_transform.a
+    bottom = top + H * t_transform.e
+
+    fig, ax = plt.subplots(1, 2, figsize=(13,5))
+
+    # Line
+    ax[0].plot(dmon["date"], dmon["sst"], lw=1.5)
+    ax[0].set_title(f"{month_names[mnum]} SST (AOI mean) 1982–2025")
+    ax[0].set_ylabel("SST (°C)")
+    ax[0].grid(True)
+
+    # Map
+    im = ax[1].imshow(
+        tmap, origin="upper", interpolation="nearest",
+        extent=[left, right, bottom, top],
+        vmin=-1.0, vmax=1.0
+    )
+    aoi.boundary.plot(ax=ax[1], color="black", linewidth=1)
+    ax[1].set_title(f"{month_names[mnum]} Trend map (°C/decade)")
+    ax[1].set_xlabel("Lon"); ax[1].set_ylabel("Lat")
+    plt.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04, label="°C/decade")
+
+    plt.tight_layout()
+    plt.show()
+
+out = widgets.Output()
+
+def on_change(change):
+    if change["name"] == "value":
+        out.clear_output(wait=True)
+        with out:
+            plot_month_view(change["new"])
+
+dropdown.observe(on_change)
+
+display(dropdown, out)
+
+with out:
+    plot_month_view(dropdown.value)
+
+!pip -q install scipy reportlab
+
+import os, glob, re, zipfile
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.mask import mask
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+from google.colab import files
+
+# =============================
+# CONFIG
+# =============================
+OUT_DIR = "/content/oisst_trend_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OISST_DIR = "/content/OISST_TIF/OISST"   # OISST monthly tif folder
+SHAPE_DIR = "/content/aoi_shape"         # AOI extract folder
+OISST_IS_KELVIN = False
+
+# outlier limits for AOI mean SST (line trend + map time-step filter)
+SST_MIN, SST_MAX = 24.0, 32.0
+
+# trend map color range (tight for clarity)
+VMIN, VMAX = 0.0, 0.6  # °C/decade
+
+month_names = {
+    1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
+    7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"
+}
+
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTH_NUM = {m:i+1 for i,m in enumerate(MONTHS)}
+
+# =============================
+# Helpers
+# =============================
+def format_p(p):
+    if p is None or (not np.isfinite(p)):
+        return "NA"
+    return f"{p:.6f}".rstrip("0").rstrip(".")
+
+def parse_year_month(fp):
+    name = os.path.basename(fp)
+    y = re.search(r"(19|20)\d{2}", name)
+    if not y:
+        return None
+    year = int(y.group(0))
+    mon = None
+    for mm in MONTHS:
+        if mm.lower() in name.lower():
+            mon = MONTH_NUM[mm]
+            break
+    return (year, mon) if mon else None
+
+# =============================
+# 1) Upload + extract AOI shapefile zip
+# =============================
+print("⬆️ Upload AOI shapefile ZIP (contains .shp/.shx/.dbf/.prj)")
+uploaded = files.upload()
+zip_name = next(iter(uploaded.keys()))
+print("Uploaded:", zip_name)
+
+os.makedirs(SHAPE_DIR, exist_ok=True)
+with zipfile.ZipFile(zip_name, "r") as z:
+    z.extractall(SHAPE_DIR)
+
+shps = glob.glob(os.path.join(SHAPE_DIR, "**", "*.shp"), recursive=True)
+print("Found shp:", shps)
+if not shps:
+    raise FileNotFoundError("No .shp found inside zip. Ensure shapefile components exist.")
+
+aoi = gpd.read_file(shps[0]).to_crs("EPSG:4326")
+aoi_union = aoi.unary_union
+print("✅ AOI loaded")
+
+# =============================
+# 2) Index OISST monthly tifs
+# =============================
+tifs = glob.glob(os.path.join(OISST_DIR, "**", "*.tif"), recursive=True)
+pairs = []
+for fp in tifs:
+    ym = parse_year_month(fp)
+    if ym:
+        pairs.append((ym[0], ym[1], fp))
+pairs.sort()
+
+print("Total tif found:", len(tifs))
+print("Indexed (year,month,tif):", len(pairs))
+if not pairs:
+    raise FileNotFoundError(f"No valid OISST tifs indexed in {OISST_DIR}. Check folder and filenames.")
+
+# =============================
+# 3) AOI area-weighted mean SST
+# =============================
+def aoi_area_weighted_mean(tif_path, aoi_geom, is_kelvin=False):
+    with rasterio.open(tif_path) as src:
+        out_img, out_tr = mask(src, [aoi_geom], crop=True, filled=False)
+        band = out_img[0]
+
+        arr = band.astype("float64")
+        arr[band.mask] = np.nan
+
+        if src.nodata is not None:
+            arr[arr == src.nodata] = np.nan
+
+        if is_kelvin:
+            arr -= 273.15
+
+        if np.all(~np.isfinite(arr)):
+            return np.nan
+
+        rows = np.arange(arr.shape[0])
+        ys = out_tr.f + (rows + 0.5) * out_tr.e
+        w = np.cos(np.deg2rad(ys))[:, None]
+
+        den = np.nansum(w * np.isfinite(arr))
+        return np.nansum(arr * w) / den if den != 0 else np.nan
+
+# =============================
+# 4) Build AOI mean dataframe
+# =============================
+rows = []
+for y, m, fp in pairs:
+    mu = aoi_area_weighted_mean(fp, aoi_union, is_kelvin=OISST_IS_KELVIN)
+    rows.append((y, m, pd.Timestamp(y, m, 1), mu))
+
+df = pd.DataFrame(rows, columns=["year","month","date","sst"])
+print(df.head(), "\nRows:", len(df))
+
+# =============================
+# 5) Monthly trend stats (outlier-removed)
+# =============================
+def month_trend_stats(df, mnum):
+    d = df[df.month == mnum].sort_values("date")
+    y = d.sst.values.astype(float)
+    x = (d.date - d.date.min()).dt.days.values / 365.25
+
+    keep = np.isfinite(y) & (y >= SST_MIN) & (y <= SST_MAX)
+    if keep.sum() < 24:
+        return None, d, keep
+
+    res = linregress(x[keep], y[keep])
+    yhat = np.full_like(y, np.nan, dtype=float)
+    yhat[keep] = res.intercept + res.slope * x[keep]
+
+    return {
+        "trend": res.slope * 10.0,   # °C/decade
+        "r2": res.rvalue**2,
+        "p": res.pvalue,
+        "yhat": yhat,
+        "n": int(keep.sum())
+    }, d, keep
+
+# =============================
+# 6) Pixel-wise trend map per month (drop bad timesteps by AOI mean)
+# =============================
+def trend_map_for_month(month_num, pairs, aoi_geom, min_count=24):
+    files_m = [(y,m,fp) for (y,m,fp) in pairs if m == month_num]
+    files_m.sort()
+
+    good = []
+    for y, m, fp in files_m:
+        mu = aoi_area_weighted_mean(fp, aoi_geom, is_kelvin=OISST_IS_KELVIN)
+        if np.isfinite(mu) and (SST_MIN <= mu <= SST_MAX):
+            good.append((y, m, fp))
+
+    if len(good) < min_count:
+        raise ValueError(f"{month_names[month_num]}: too few good timesteps ({len(good)}). Try widen SST_MIN/MAX.")
+
+    dates = pd.to_datetime([f"{y}-{m:02d}-01" for (y,m,_) in good])
+    x = (dates - dates.min()).days.values / 365.25
+    x = x.astype("float64")
+
+    stack = []
+    x_keep = []
+    ref_tr = None
+    ref_shape = None
+
+    for (y,m,fp), xv in zip(good, x):
+        with rasterio.open(fp) as src:
+            out_img, out_tr = mask(src, [aoi_geom], crop=True, filled=False)
+            band = out_img[0]
+            arr = band.astype("float64")
+            arr[band.mask] = np.nan
+
+            if src.nodata is not None:
+                arr[arr == src.nodata] = np.nan
+            if OISST_IS_KELVIN:
+                arr -= 273.15
+
+            if ref_shape is None:
+                ref_shape = arr.shape
+                ref_tr = out_tr
+
+        if arr.shape != ref_shape:
+            continue
+
+        # sanity clip (optional)
+        arr[(arr < -5) | (arr > 50)] = np.nan
+
+        stack.append(arr)
+        x_keep.append(xv)
+
+    if len(stack) < min_count:
+        raise ValueError(f"{month_names[month_num]}: stack too small after cleaning ({len(stack)}).")
+
+    stack = np.stack(stack, axis=0)               # (T,H,W)
+    x3 = np.array(x_keep)[:, None, None]          # (T,1,1)
+
+    valid = np.isfinite(stack)
+    cnt = valid.sum(axis=0).astype("float64")     # (H,W)
+
+    # safe mean (avoid divide-by-zero)
+    xm = np.full_like(cnt, np.nan)
+    ym = np.full_like(cnt, np.nan)
+    okc = cnt > 0
+    xm[okc] = np.sum(np.where(valid, x3, 0.0), axis=0)[okc] / cnt[okc]
+    ym[okc] = np.sum(np.where(valid, stack, 0.0), axis=0)[okc] / cnt[okc]
+
+    dx = x3 - xm
+    dy = stack - ym
+
+    cov = np.sum(np.where(valid, dx*dy, 0.0), axis=0)
+    var = np.sum(np.where(valid, dx*dx, 0.0), axis=0)
+
+    slope = np.full_like(ym, np.nan)
+    ok = (cnt >= min_count) & (var > 0)
+    slope[ok] = cov[ok] / var[ok]
+
+    trend_map = (slope * 10.0).astype("float32")  # °C/decade
+    return trend_map, ref_tr
+
+# =============================
+# 7) Summary CSV
+# =============================
+summary = []
+for m in range(1, 13):
+    stats, _, keep = month_trend_stats(df, m)
+    if stats:
+        summary.append([month_names[m], stats["trend"], stats["r2"], format_p(stats["p"]), stats["n"]])
+    else:
+        summary.append([month_names[m], np.nan, np.nan, "", int(np.sum(keep))])
+
+df_sum = pd.DataFrame(summary, columns=["month","trend_C_decade","R2","p_value","n"])
+csv_path = os.path.join(OUT_DIR, "Monthly_Trend_Summary_BoB.csv")
+df_sum.to_csv(csv_path, index=False)
+print("✅ Saved CSV:", csv_path)
+
+# =============================
+# 8) ONE BIG PNG (12× line + map)
+# =============================
+png_path = os.path.join(OUT_DIR, "AllMonths_Line_and_TrendMap.png")
+
+fig, axes = plt.subplots(12, 2, figsize=(14, 26))
+plt.subplots_adjust(hspace=0.35, wspace=0.05)
+
+last_im = None
+
+for m in range(1, 13):
+    axL, axM = axes[m-1]
+
+    stats, dmon, keep = month_trend_stats(df, m)
+
+    axL.plot(dmon.date, dmon.sst, lw=0.8)
+    if stats:
+        axL.plot(dmon.date, stats["yhat"], lw=1.2)
+
+        txt = (f"{month_names[m]}\n"
+               f"Trend: {stats['trend']:.2f} °C/decade\n"
+               f"R²: {stats['r2']:.2f}\n"
+               f"p: {format_p(stats['p'])}")
+    else:
+        txt = f"{month_names[m]}\nNo valid trend"
+
+    axL.text(0.02, 0.95, txt, transform=axL.transAxes,
+             va="top", fontsize=8,
+             bbox=dict(facecolor="white", alpha=0.85))
+    axL.set_ylim(SST_MIN, SST_MAX)
+    axL.set_ylabel("SST (°C)")
+    axL.grid(alpha=0.25)
+    if m != 12:
+        axL.set_xticklabels([])
+
+    try:
+        tmap, tr = trend_map_for_month(m, pairs, aoi_union, min_count=24)
+        H, W = tmap.shape
+        left, top = tr.c, tr.f
+        right = left + W * tr.a
+        bottom = top + H * tr.e
+
+        last_im = axM.imshow(
+            tmap, origin="upper",
+            extent=[left, right, bottom, top],
+            vmin=VMIN, vmax=VMAX,
+            interpolation="nearest"
+        )
+        aoi.boundary.plot(ax=axM, color="black", lw=0.8)
+
+    except Exception as e:
+        axM.axis("off")
+        axM.text(0.5, 0.5, f"Map failed", ha="center", va="center", fontsize=8)
+
+if last_im is not None:
+    cbar = fig.colorbar(last_im, ax=axes[:, 1], fraction=0.03, pad=0.01)
+    cbar.set_label("°C/decade")
+
+fig.savefig(png_path, dpi=300, bbox_inches="tight")
+plt.close(fig)
+print("✅ Saved PNG:", png_path)
+
+# =============================
+# 9) PDF report (PNG + table)
+# =============================
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+from reportlab.lib.pagesizes import landscape, A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+
+pdf_path = os.path.join(OUT_DIR, "OISST_BoB_Monthly_Report.pdf")
+doc = SimpleDocTemplate(pdf_path, pagesize=landscape(A4))
+styles = getSampleStyleSheet()
+
+story = [
+    Paragraph("OISST Bay of Bengal Monthly SST Trends (1982–2025)", styles["Title"]),
+    Spacer(1, 8),
+    RLImage(png_path, width=650, height=430),
+    Spacer(1, 10)
+]
+
+tbl = Table([df_sum.columns.tolist()] + df_sum.values.tolist(), repeatRows=1)
+tbl.setStyle(TableStyle([
+    ("GRID", (0,0), (-1,-1), 0.4, colors.grey),
+    ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+    ("FONTSIZE", (0,0), (-1,-1), 8),
+]))
+story.append(tbl)
+doc.build(story)
+print("✅ Saved PDF:", pdf_path)
+
+# =============================
+# 10) Download outputs
+# =============================
+files.download(png_path)
+files.download(csv_path)
+files.download(pdf_path)
+
+# --- Install (only once) ---
+!pip -q install xlsxwriter
+
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+from google.colab import files
+
+# =============================
+# OUTPUT FOLDERS
+# =============================
+OUT_TIF_DIR = os.path.join(OUT_DIR, "Monthly_Trend_GeoTIFFs")
+os.makedirs(OUT_TIF_DIR, exist_ok=True)
+
+excel_path = os.path.join(OUT_DIR, "OISST_BoB_All_Data.xlsx")
+
+# =============================
+# Helper: save GeoTIFF
+# =============================
+def save_geotiff(arr, transform, out_fp, crs="EPSG:4326"):
+    H, W = arr.shape
+    profile = {
+        "driver": "GTiff",
+        "height": H,
+        "width": W,
+        "count": 1,
+        "dtype": "float32",
+        "crs": crs,
+        "transform": transform,
+        "nodata": -9999.0,
+        "compress": "lzw"
+    }
+    arr2 = np.where(np.isfinite(arr), arr, profile["nodata"]).astype("float32")
+    with rasterio.open(out_fp, "w", **profile) as dst:
+        dst.write(arr2, 1)
+
+# =============================
+# 1) EXPORT 12 MONTHLY TREND GeoTIFFs
+# =============================
+print("🔹 Exporting monthly trend GeoTIFFs...")
+
+trend_maps = {}  # keep for stats if needed later
+
+for m in range(1, 13):
+    # Use your clean trend-map function
+    tmap, tr = trend_map_for_month(
+        m,
+        pairs,
+        aoi_union,
+        min_count=24
+    )
+
+    out_tif = os.path.join(
+        OUT_TIF_DIR,
+        f"OISST_BoB_Trend_{month_names[m]}_C_per_decade.tif"
+    )
+
+    save_geotiff(tmap, tr, out_tif)
+    trend_maps[m] = tmap
+
+    print("Saved:", out_tif)
+
+# =============================
+# 2) BUILD EXCEL WITH MULTIPLE SHEETS
+# =============================
+print("\n🔹 Writing Excel workbook with multiple sheets...")
+
+with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
+
+    # ---- Sheet 1: Full AOI monthly mean time series ----
+    df_sorted = df.sort_values("date")
+    df_sorted.to_excel(
+        writer,
+        sheet_name="AOI_Monthly_Mean_TimeSeries",
+        index=False
+    )
+
+    # ---- Sheet 2: Monthly trend summary ----
+    summary_rows = []
+    for m in range(1, 13):
+        stats, _, keep = month_trend_stats(df, m)
+        if stats:
+            summary_rows.append([
+                month_names[m],
+                stats["trend"],
+                stats["r2"],
+                stats["p"],
+                stats["n"]
+            ])
+        else:
+            summary_rows.append([
+                month_names[m],
+                np.nan, np.nan, np.nan, int(np.sum(keep))
+            ])
+
+    df_summary = pd.DataFrame(
+        summary_rows,
+        columns=["Month", "Trend_C_per_decade", "R2", "p_value", "N_points"]
+    )
+
+    df_summary.to_excel(
+        writer,
+        sheet_name="Monthly_Trend_Summary",
+        index=False
+    )
+
+    # ---- Sheet 3–14: Month-wise AOI mean SST ----
+    for m in range(1, 13):
+        dmon = df[df["month"] == m].sort_values("date")
+        dmon_out = dmon[["year", "month", "date", "sst"]].copy()
+
+        dmon_out.to_excel(
+            writer,
+            sheet_name=month_names[m],
+            index=False
+        )
+
+print("✅ Excel saved:", excel_path)
+
+# =============================
+# 3) DOWNLOAD OUTPUTS
+# =============================
+files.download(excel_path)
+
+print("\n📦 GeoTIFFs are in folder:", OUT_TIF_DIR)
+print("👉 You can zip & download them if you want.")
+
+import os, glob, zipfile
+from google.colab import files
+
+# paths (আপনার আগের কোডে যেগুলো আছে)
+OUT_TIF_DIR = os.path.join(OUT_DIR, "Monthly_Trend_GeoTIFFs")
+excel_path = os.path.join(OUT_DIR, "OISST_BoB_All_Data.xlsx")
+
+zip_path = os.path.join(OUT_DIR, "OISST_BoB_Outputs.zip")
+
+# collect files to zip
+tifs = sorted(glob.glob(os.path.join(OUT_TIF_DIR, "*.tif")))
+to_zip = []
+
+if os.path.exists(excel_path):
+    to_zip.append(excel_path)
+else:
+    print("⚠️ Excel not found:", excel_path)
+
+if len(tifs) > 0:
+    to_zip.extend(tifs)
+else:
+    print("⚠️ No tif found in:", OUT_TIF_DIR)
+
+# create zip
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for fp in to_zip:
+        # keep clean names inside zip
+        arcname = os.path.join("Monthly_Trend_GeoTIFFs", os.path.basename(fp)) if fp.endswith(".tif") else os.path.basename(fp)
+        z.write(fp, arcname=arcname)
+
+print("✅ ZIP created:", zip_path)
+files.download(zip_path)
